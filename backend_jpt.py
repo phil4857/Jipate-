@@ -1,64 +1,53 @@
+
 from fastapi import FastAPI, Form, HTTPException
+from fastapi.responses import JSONResponse
 from pydantic import BaseModel
 from datetime import datetime, timedelta
-from typing import Dict
+from typing import Dict, Optional
 import uuid
 
 app = FastAPI()
 
+# In-memory databases
 users: Dict[str, dict] = {}
 investments: Dict[str, dict] = {}
 
-JOINING_FEE = 1000  # Set the standard joining fee here
+# Constants
+JOINING_FEE = 1000
+DAILY_EARNING_PERCENT = 0.10
+SUNDAY_DISCOUNT = 0.05
+REFERRAL_REWARD = 200
 
-# =========================
-# Models
-# =========================
-
-class Investment(BaseModel):
-    username: str
-    amount: float
-
-class Approval(BaseModel):
-    username: str
-
-class Login(BaseModel):
-    username: str
-    password: str
-
-class WithdrawRequest(BaseModel):
-    username: str
-    amount: float
-
-# =========================
-# Routes
-# =========================
+def is_sunday():
+    return datetime.now().weekday() == 6
 
 @app.get("/")
 def root():
     return {"message": "Welcome to Jipate Bonus"}
 
 @app.post("/register")
-def register(username: str = Form(...), password: str = Form(...)):
+def register(username: str = Form(...), password: str = Form(...), referrer_code: Optional[str] = Form(None)):
     if username in users:
-        raise HTTPException(status_code=400, detail="User already exists")
+        raise HTTPException(status_code=400, detail="Username already exists")
 
-    today = datetime.now()
     joining_fee = JOINING_FEE
+    if is_sunday():
+        joining_fee -= JOINING_FEE * SUNDAY_DISCOUNT
 
-    if today.strftime("%A") == "Sunday":
-        joining_fee *= 0.95  # 5% discount
+    referral_id = str(uuid.uuid4())[:6]
 
     users[username] = {
+        "username": username,
         "password": password,
         "approved": False,
-        "registered_at": today,
-        "joining_fee_paid": joining_fee,
-        "balance": 0,
-        "invested": 0,
-        "investment_date": None
+        "joined_on": str(datetime.now()),
+        "referral_id": referral_id,
+        "referrer_code": referrer_code,
+        "referral_earned": 0,
+        "invested": False,
+        "balance": 0
     }
-    return {"message": f"User registered successfully. Joining fee paid: {joining_fee}"}
+    return {"message": "User registered successfully", "joining_fee": joining_fee, "referral_id": referral_id}
 
 @app.post("/login")
 def login(username: str = Form(...), password: str = Form(...)):
@@ -68,69 +57,70 @@ def login(username: str = Form(...), password: str = Form(...)):
     return {"message": "Login successful"}
 
 @app.post("/invest")
-def invest(investment: Investment):
-    user = users.get(investment.username)
+def invest(username: str = Form(...), amount: float = Form(...)):
+    user = users.get(username)
     if not user or not user["approved"]:
         raise HTTPException(status_code=403, detail="User not approved or doesn't exist")
-    
-    if user["investment_date"] is None:
-        user["investment_date"] = datetime.now()
-    
-    user["invested"] += investment.amount
-    user["balance"] += investment.amount
-    return {"message": f"Invested {investment.amount} successfully."}
+
+    if username in investments:
+        raise HTTPException(status_code=400, detail="User already has an investment")
+
+    investments[username] = {
+        "amount": amount,
+        "last_earning_date": datetime.now()
+    }
+    user["invested"] = True
+
+    # Reward referrer if applicable
+    ref_code = user.get("referrer_code")
+    if ref_code:
+        for u in users.values():
+            if u["referral_id"] == ref_code:
+                u["referral_earned"] += REFERRAL_REWARD
+                u["balance"] += REFERRAL_REWARD
+                break
+
+    return {"message": "Investment successful", "amount": amount}
 
 @app.post("/admin/approve_user")
-def approve_user(approval: Approval):
-    user = users.get(approval.username)
+def approve_user(username: str = Form(...)):
+    user = users.get(username)
     if not user:
         raise HTTPException(status_code=404, detail="User not found")
     user["approved"] = True
-    return {"message": f"User {approval.username} approved."}
+    return {"message": f"User {username} approved."}
 
 @app.post("/admin/approve_investment")
-def approve_investment(approval: Approval):
-    user = users.get(approval.username)
-    if not user or not user["investment_date"]:
-        raise HTTPException(status_code=404, detail="No investment found")
-    
-    now = datetime.now()
-    days = (now - user["investment_date"]).days
-    if days > 0:
-        earnings = user["invested"] * 0.10 * days  # 10% per day
-        user["balance"] += earnings
-        user["investment_date"] = now
-        return {"message": f"{days} days of earnings applied. Total earned: {earnings}"}
-    else:
-        return {"message": "No earnings to apply yet."}
+def approve_investment(username: str = Form(...)):
+    if username not in users or username not in investments:
+        raise HTTPException(status_code=404, detail="User or investment not found")
+    # Assume "approved" means investment is ready to earn
+    return {"message": f"Investment for {username} approved."}
+
+@app.post("/earnings/daily")
+def apply_daily_earnings():
+    applied_users = []
+    for username, data in investments.items():
+        last_date = data["last_earning_date"]
+        if datetime.now() - last_date >= timedelta(days=1):
+            earnings = data["amount"] * DAILY_EARNING_PERCENT
+            users[username]["balance"] += earnings
+            data["last_earning_date"] = datetime.now()
+            applied_users.append({"username": username, "earned": earnings})
+    return {"message": "Daily earnings applied", "details": applied_users}
+
+@app.post("/withdraw")
+def withdraw(username: str = Form(...), amount: float = Form(...)):
+    user = users.get(username)
+    if not user:
+        raise HTTPException(status_code=404, detail="User not found")
+
+    if amount > user["balance"]:
+        raise HTTPException(status_code=400, detail="Insufficient balance")
+
+    user["balance"] -= amount
+    return {"message": f"Withdrawal of {amount} successful", "remaining_balance": user["balance"]}
 
 @app.get("/admin/view_users")
 def view_users():
-    return users
-
-@app.post("/earnings/daily")
-def apply_daily_earnings(approval: Approval):
-    user = users.get(approval.username)
-    if not user or not user["investment_date"]:
-        raise HTTPException(status_code=404, detail="No investment found")
-
-    now = datetime.now()
-    days = (now - user["investment_date"]).days
-    if days > 0:
-        earnings = user["invested"] * 0.10 * days
-        user["balance"] += earnings
-        user["investment_date"] = now
-        return {"message": f"{days} days of earnings applied. Total earned: {earnings}"}
-    else:
-        return {"message": "No earnings to apply yet."}
-
-@app.post("/withdraw")
-def withdraw(request: WithdrawRequest):
-    user = users.get(request.username)
-    if not user:
-        raise HTTPException(status_code=404, detail="User not found")
-    if request.amount > user["balance"]:
-        raise HTTPException(status_code=400, detail="Insufficient balance")
-
-    user["balance"] -= request.amount
-    return {"message": f"Withdrew {request.amount} successfully."}
+    return {"users": list(users.values())}
